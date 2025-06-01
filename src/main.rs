@@ -1,3 +1,8 @@
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
+
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::{
@@ -6,7 +11,13 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Fullscreen, Window, WindowId},
 };
-// ===== 配置常量定义区域 =====
+// ===== 配置常量定义区域 =====、
+// 在常量定义区域添加工具栏相关常量
+const TOOLBAR_HEIGHT: f32 = 40.0; // 工具栏高度
+const TOOLBAR_BACKGROUND_COLOR: [f32; 4] = [1.0, 1.0, 1.0, 0.9]; // 白色半透明背景
+const TOOLBAR_BUTTON_SIZE: f32 = 40.0; // 工具按钮大小
+const TOOLBAR_BUTTON_MARGIN: f32 = 10.0; // 按钮间距
+const TOOLBAR_ICON_SIZE: f32 = 24.0; // 图标大小
 // 颜色常量 (RGB 0.0-1.0 范围)
 const RED: [f32; 3] = [1.0, 0.0, 0.0]; // 红色
 const GREEN: [f32; 3] = [0.0, 1.0, 0.0]; // 绿色
@@ -37,7 +48,26 @@ const TEST_TEXTURE_COLOR: [u8; 4] = [255, 0, 0, 255]; // 测试纹理颜色(红�
 // Uniform缓冲区对齐常量
 const UNIFORM_BUFFER_SIZE: usize = 18; // 
 // ===== 常量定义结束 =====
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tool {
+    Rectangle, // 画框
+    Circle,    // 画圆
+    Arrow,     // 箭头
+    Pen,       // 笔画
+    Text,      // 文字
+    Undo,      // 撤销
+    Save,      // 保存
+    Exit,      // 退出
+    Complete,  // 完成
+}
 
+// 工具栏按钮结构
+struct ToolbarButton {
+    tool: Tool,
+    rect: (f32, f32, f32, f32), // x, y, width, height
+    label: &'static str,
+    is_selected: bool,
+}
 struct State {
     window: Arc<Window>,
     device: wgpu::Device,
@@ -56,6 +86,14 @@ struct State {
     handle_border_width: f32,
     border_color: [f32; 3],
     handle_color: [f32; 3],
+    // 工具栏相关
+    toolbar_buttons: Vec<ToolbarButton>,
+    current_tool: Tool,
+    show_toolbar: bool,
+    current_box_coords: Option<(f32, f32, f32, f32)>, // 添加这个字段
+    mouse_position: Option<(f32, f32)>,               // 添加鼠标位置跟踪
+    hovered_button: Option<usize>,                    // 添加悬停按钮索引
+    toolbar_active: bool, // 新增：工具栏是否处于激活状态（点击过工具栏）
 }
 
 impl State {
@@ -167,27 +205,32 @@ impl State {
         });
 
         let size = window.inner_size();
+        let show_toolbar_initial = false;
         let box_data = [
-            -1.0f32,                     // 0: box_min.x
-            -1.0f32,                     // 1: box_min.y
-            -1.0f32,                     // 2: box_max.x
-            -1.0f32,                     // 3: box_max.y
-            size.width as f32,           // 4: screen_size.x
-            size.height as f32,          // 5: screen_size.y
-            DEFAULT_BORDER_WIDTH,        // 6: border_width
-            DEFAULT_HANDLE_SIZE,         // 7: handle_size
-            DEFAULT_HANDLE_BORDER_WIDTH, // 8: handle_border_width
-            0.0f32,                      // 18: _padding1[0] - 新增
-            0.0f32,                      // 18: _padding1[0] - 新增
-            0.0f32,                      // 18: _padding1[0] - 新增
-            DEFAULT_BORDER_COLOR[0],     // 10: border_color.r
-            DEFAULT_BORDER_COLOR[1],     // 11: border_color.g
-            DEFAULT_BORDER_COLOR[2],     // 12: border_color.b
-            1.0f32,                      // 13: border_color.a
-            DEFAULT_HANDLE_COLOR[0],     // 14: handle_color.r
-            DEFAULT_HANDLE_COLOR[1],     // 15: handle_color.g
-            DEFAULT_HANDLE_COLOR[2],     // 16: handle_color.b
-            1.0f32,                      // 17: handle_color.a
+            -1.0f32,                                      // 0: box_min.x
+            -1.0f32,                                      // 1: box_min.y
+            -1.0f32,                                      // 2: box_max.x
+            -1.0f32,                                      // 3: box_max.y
+            size.width as f32,                            // 4: screen_size.x
+            size.height as f32,                           // 5: screen_size.y
+            DEFAULT_BORDER_WIDTH,                         // 6: border_width
+            DEFAULT_HANDLE_SIZE,                          // 7: handle_size
+            DEFAULT_HANDLE_BORDER_WIDTH,                  // 8: handle_border_width
+            if show_toolbar_initial { 1.0 } else { 0.0 }, // 9: show_toolbar
+            TOOLBAR_HEIGHT,                               // 10: toolbar_height
+            -1.0f32,                                      // 11: hovered_button (初始无悬停)
+            0.0f32,                                       // 12: toolbar_active (初始未激活)
+            -1.0f32,                                      // 13: selected_button (初始无选中)
+            0.0f32,                                       // 14: _padding.x
+            0.0f32,                                       // 15: _padding.y
+            DEFAULT_BORDER_COLOR[0],                      // 16: border_color.r
+            DEFAULT_BORDER_COLOR[1],                      // 17: border_color.g
+            DEFAULT_BORDER_COLOR[2],                      // 18: border_color.b
+            1.0f32,                                       // 19: border_color.a
+            DEFAULT_HANDLE_COLOR[0],                      // 20: handle_color.r
+            DEFAULT_HANDLE_COLOR[1],                      // 21: handle_color.g
+            DEFAULT_HANDLE_COLOR[2],                      // 22: handle_color.b
+            1.0f32,                                       // 23: handle_color.a
         ];
 
         let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -212,11 +255,242 @@ impl State {
             handle_border_width: DEFAULT_HANDLE_BORDER_WIDTH,
             border_color: DEFAULT_BORDER_COLOR,
             handle_color: DEFAULT_HANDLE_COLOR,
+            toolbar_buttons: Vec::new(),
+            current_tool: Tool::Rectangle,
+            show_toolbar: show_toolbar_initial,
+            current_box_coords: None, // 初始化
+            mouse_position: None,
+            hovered_button: None,
+            toolbar_active: false, // 新增
         };
 
         state.configure_surface();
         state.load_screenshot();
+        state.initialize_toolbar();
         state
+    }
+    fn update_mouse_position(&mut self, x: f32, y: f32) {
+        self.mouse_position = Some((x, y));
+
+        // 检查是否悬停在工具栏按钮上
+        let old_hovered = self.hovered_button;
+        self.hovered_button = None;
+        if self.show_toolbar {
+            for (i, button) in self.toolbar_buttons.iter().enumerate() {
+                let (btn_x, btn_y, btn_w, btn_h) = button.rect;
+                if x >= btn_x && x <= btn_x + btn_w && y >= btn_y && y <= btn_y + btn_h {
+                    self.hovered_button = Some(i);
+                    break;
+                }
+            }
+        }
+        // 如果悬停状态发生变化，更新uniform数据
+        if old_hovered != self.hovered_button {
+            self.update_uniforms();
+        }
+    }
+    // 初始化工具栏
+    fn initialize_toolbar(&mut self) {
+        self.toolbar_buttons = vec![
+            ToolbarButton {
+                tool: Tool::Rectangle,
+                rect: (0.0, 0.0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE),
+                label: "⬛", // 矩形
+                is_selected: false,
+            },
+            ToolbarButton {
+                tool: Tool::Circle,
+                rect: (0.0, 0.0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE),
+                label: "⭕", // 圆形
+                is_selected: false,
+            },
+            ToolbarButton {
+                tool: Tool::Arrow,
+                rect: (0.0, 0.0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE),
+                label: "➤", // 箭头
+                is_selected: false,
+            },
+            ToolbarButton {
+                tool: Tool::Pen,
+                rect: (0.0, 0.0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE),
+                label: "✏️", // 笔
+                is_selected: false,
+            },
+            ToolbarButton {
+                tool: Tool::Text,
+                rect: (0.0, 0.0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE),
+                label: "𝐀", // 文字
+                is_selected: false,
+            },
+            ToolbarButton {
+                tool: Tool::Undo,
+                rect: (0.0, 0.0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE),
+                label: "↶", // 撤销
+                is_selected: false,
+            },
+            ToolbarButton {
+                tool: Tool::Save,
+                rect: (0.0, 0.0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE),
+                label: "💾", // 保存
+                is_selected: false,
+            },
+            ToolbarButton {
+                tool: Tool::Exit,
+                rect: (0.0, 0.0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE),
+                label: "❌", // 退出
+                is_selected: false,
+            },
+            ToolbarButton {
+                tool: Tool::Complete,
+                rect: (0.0, 0.0, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE),
+                label: "✅", // 完成
+                is_selected: false,
+            },
+        ];
+        self.update_toolbar_layout();
+    }
+    // 更新工具栏布局
+    fn update_toolbar_layout(&mut self) {
+        if let Some((box_min_x, box_min_y, box_max_x, box_max_y)) = self.get_current_box_coords() {
+            // 首先尝试在框的下方显示工具栏
+            let mut toolbar_y = box_max_y + 10.0;
+            let toolbar_start_x = box_min_x;
+
+            // 计算工具栏总宽度
+            let total_width = (self.toolbar_buttons.len() as f32)
+                * (TOOLBAR_BUTTON_SIZE + TOOLBAR_BUTTON_MARGIN)
+                - TOOLBAR_BUTTON_MARGIN;
+
+            // 检查工具栏是否超出屏幕下边界
+            let toolbar_bottom = toolbar_y + TOOLBAR_HEIGHT;
+            if toolbar_bottom > self.size.height as f32 {
+                // 如果超出下边界，将工具栏移到框的上方
+                toolbar_y = box_min_y - TOOLBAR_HEIGHT - 10.0;
+
+                // 如果移到上方还是超出屏幕，则放在屏幕顶部
+                if toolbar_y < 0.0 {
+                    toolbar_y = 10.0;
+                }
+            }
+
+            // 调整X坐标，确保工具栏不超出屏幕左右边界
+            let adjusted_x = if toolbar_start_x + total_width > self.size.width as f32 {
+                (self.size.width as f32 - total_width).max(0.0)
+            } else {
+                toolbar_start_x.max(0.0)
+            };
+
+            // 更新所有按钮的位置
+            for (i, button) in self.toolbar_buttons.iter_mut().enumerate() {
+                let x = adjusted_x + (i as f32) * (TOOLBAR_BUTTON_SIZE + TOOLBAR_BUTTON_MARGIN);
+                button.rect = (x, toolbar_y, TOOLBAR_BUTTON_SIZE, TOOLBAR_BUTTON_SIZE);
+            }
+        }
+    }
+
+    // 获取当前框坐标
+    fn get_current_box_coords(&self) -> Option<(f32, f32, f32, f32)> {
+        // 这里需要存储当前框坐标
+        self.current_box_coords
+    }
+    // 更新当前框坐标
+    fn set_current_box_coords(&mut self, coords: Option<(f32, f32, f32, f32)>) {
+        self.current_box_coords = coords;
+        // 移除这里的show_toolbar调用，避免重复借用
+        if coords.is_some() {
+            self.update_toolbar_layout();
+        }
+    }
+    // 显示工具栏
+    fn show_toolbar(&mut self) {
+        self.show_toolbar = true;
+        if self.current_box_coords.is_some() {
+            self.update_toolbar_layout();
+        }
+    }
+
+    // 隐藏工具栏
+    fn hide_toolbar(&mut self) {
+        self.show_toolbar = false;
+    }
+
+    // 检查鼠标是否在工具栏按钮上
+    fn get_toolbar_button_at(&self, x: f32, y: f32) -> Option<Tool> {
+        if !self.show_toolbar {
+            return None;
+        }
+
+        for button in &self.toolbar_buttons {
+            let (btn_x, btn_y, btn_w, btn_h) = button.rect;
+            if x >= btn_x && x <= btn_x + btn_w && y >= btn_y && y <= btn_y + btn_h {
+                return Some(button.tool);
+            }
+        }
+        None
+    }
+
+    // 设置当前工具
+    fn set_current_tool(&mut self, tool: Tool) {
+        self.current_tool = tool;
+    }
+
+    // 处理工具栏按钮点击
+    fn handle_toolbar_click(&mut self, tool: Tool) -> bool {
+        println!("Toolbar clicked: {:?}", tool); // 调试信息
+
+        // 激活工具栏状态
+        self.toolbar_active = true;
+
+        // 更新按钮选中状态 - 所有按钮先设为未选中
+        for button in &mut self.toolbar_buttons {
+            button.is_selected = false;
+        }
+
+        // 设置当前点击的按钮为选中状态
+        for (i, button) in self.toolbar_buttons.iter_mut().enumerate() {
+            if button.tool == tool {
+                button.is_selected = true;
+                println!("Button {} ({:?}) selected", i, tool); // 调试信息
+                break;
+            }
+        }
+
+        // 验证选中状态
+        let selected_count = self
+            .toolbar_buttons
+            .iter()
+            .filter(|b| b.is_selected)
+            .count();
+        println!("Total selected buttons: {}", selected_count); // 调试信息
+        match tool {
+            Tool::Rectangle | Tool::Circle | Tool::Arrow | Tool::Pen | Tool::Text => {
+                self.set_current_tool(tool);
+                self.update_uniforms(); // 更新uniform数据
+                false // 不退出应用
+            }
+            Tool::Undo => {
+                // TODO: 实现撤销功能
+                println!("撤销操作");
+                self.update_uniforms(); // 重要：更新uniform数据
+                false
+            }
+            Tool::Save => {
+                // TODO: 实现保存功能
+                println!("保存截图");
+                self.update_uniforms(); // 重要：更新uniform数据
+                false
+            }
+            Tool::Exit => {
+                // self.update_uniforms(); // 重要：更新uniform数据
+                true // 退出应用
+            }
+            Tool::Complete => {
+                // TODO: 完成截图并复制到剪贴板
+                println!("完成截图");
+                self.update_uniforms(); // 重要：更新uniform数据
+                false // 改为不退出，让用户看到选中效果
+            }
+        }
     }
     fn load_screenshot_from_data(&mut self, rgba: Vec<u8>, width: u32, height: u32) {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
@@ -306,9 +580,47 @@ impl State {
 
     // 更新所有uniform数据
     fn update_uniforms(&mut self) {
-        if let Some((min_x, min_y, max_x, max_y)) = self.get_current_box() {
-            self.update_box_with_params(min_x, min_y, max_x, max_y);
-        }
+        let hovered_index = self.hovered_button.map(|i| i as f32).unwrap_or(-1.0);
+        let selected_index = self
+            .toolbar_buttons
+            .iter()
+            .position(|btn| btn.is_selected)
+            .map(|i| i as f32)
+            .unwrap_or(-1.0);
+
+        let uniform_data = [
+            self.current_box_coords
+                .map_or(-1.0, |(min_x, _, _, _)| min_x), // 0: box_min.x
+            self.current_box_coords
+                .map_or(-1.0, |(_, min_y, _, _)| min_y), // 1: box_min.y
+            self.current_box_coords
+                .map_or(-1.0, |(_, _, max_x, _)| max_x), // 2: box_max.x
+            self.current_box_coords
+                .map_or(-1.0, |(_, _, _, max_y)| max_y), // 3: box_max.y
+            self.size.width as f32,                      // 4: screen_size.x
+            self.size.height as f32,                     // 5: screen_size.y
+            self.border_width,                           // 6: border_width
+            self.handle_size,                            // 7: handle_size
+            self.handle_border_width,                    // 8: handle_border_width
+            if self.show_toolbar { 1.0 } else { 0.0 },   // 9: show_toolbar
+            TOOLBAR_HEIGHT,                              // 10: toolbar_height
+            hovered_index,                               // 11: hovered_button
+            if self.toolbar_active { 1.0 } else { 0.0 }, // 12: toolbar_active
+            selected_index,                              // 13: selected_button
+            0.0,                                         // 14: _padding.x
+            0.0,                                         // 15: _padding.y
+            self.border_color[0],                        // 16: border_color.r
+            self.border_color[1],                        // 17: border_color.g
+            self.border_color[2],                        // 18: border_color.b
+            1.0,                                         // 19: border_color.a
+            self.handle_color[0],                        // 20: handle_color.r
+            self.handle_color[1],                        // 21: handle_color.g
+            self.handle_color[2],                        // 22: handle_color.b
+            1.0,                                         // 23: handle_color.a
+        ];
+
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&uniform_data));
     }
     fn update_box(&mut self, min_x: f32, min_y: f32, max_x: f32, max_y: f32) {
         self.update_box_with_params(min_x, min_y, max_x, max_y);
@@ -376,52 +688,68 @@ impl State {
         self.size = new_size;
         self.configure_surface();
 
+        let hovered_index = self.hovered_button.map(|i| i as f32).unwrap_or(-1.0);
+        let selected_index = self
+            .toolbar_buttons
+            .iter()
+            .position(|btn| btn.is_selected)
+            .map(|i| i as f32)
+            .unwrap_or(-1.0);
+
         let box_data = if let Some((min_x, min_y, max_x, max_y)) = current_box {
             [
-                min_x,
-                min_y,
-                max_x,
-                max_y,
-                new_size.width as f32,
-                new_size.height as f32,
-                self.border_width,        // border_width
-                self.handle_size,         // handle_size
-                self.handle_border_width, // handle_border_width
-                0.0f32,                   // 18: _padding1[0] - 新增
-                0.0f32,                   // 18: _padding1[0] - 新增
-                0.0f32,                   // 18: _padding1[0] - 新增
-                self.border_color[0],     // border_color.r
-                self.border_color[1],     // border_color.g
-                self.border_color[2],     // border_color.b
-                1.0,                      // border_color.a
-                self.handle_color[0],     // handle_color.r
-                self.handle_color[1],     // handle_color.g
-                self.handle_color[2],     // handle_color.b
-                1.0,                      // handle_color.a
+                min_x,                                       // 0: box_min.x
+                min_y,                                       // 1: box_min.y
+                max_x,                                       // 2: box_max.x
+                max_y,                                       // 3: box_max.y
+                new_size.width as f32,                       // 4: screen_size.x
+                new_size.height as f32,                      // 5: screen_size.y
+                self.border_width,                           // 6: border_width
+                self.handle_size,                            // 7: handle_size
+                self.handle_border_width,                    // 8: handle_border_width
+                if self.show_toolbar { 1.0 } else { 0.0 },   // 9: show_toolbar
+                TOOLBAR_HEIGHT,                              // 10: toolbar_height
+                hovered_index,                               // 11: hovered_button
+                if self.toolbar_active { 1.0 } else { 0.0 }, // 12: toolbar_active
+                selected_index,                              // 13: selected_button
+                0.0,                                         // 14: _padding.x
+                0.0,                                         // 15: _padding.y
+                self.border_color[0],                        // 16: border_color.r
+                self.border_color[1],                        // 17: border_color.g
+                self.border_color[2],                        // 18: border_color.b
+                1.0,                                         // 19: border_color.a
+                self.handle_color[0],                        // 20: handle_color.r
+                self.handle_color[1],                        // 21: handle_color.g
+                self.handle_color[2],                        // 22: handle_color.b
+                1.0,                                         // 23: handle_color.a
             ]
         } else {
             // 没有框时，使用无效坐标
             [
-                -1.0f32,
-                -1.0f32,
-                -1.0f32,
-                -1.0f32,
-                new_size.width as f32,
-                new_size.height as f32,
-                self.border_width,        // border_width
-                self.handle_size,         // handle_size
-                self.handle_border_width, // handle_border_width
-                0.0f32,                   // 18: _padding1[0] - 新增
-                0.0f32,                   // 18: _padding1[0] - 新增
-                0.0f32,                   // 18: _padding1[0] - 新增
-                self.border_color[0],     // border_color.r
-                self.border_color[1],     // border_color.g
-                self.border_color[2],     // border_color.b
-                1.0,                      // border_color.a
-                self.handle_color[0],     // handle_color.r
-                self.handle_color[1],     // handle_color.g
-                self.handle_color[2],     // handle_color.b
-                1.0,                      // handle_color.a
+                -1.0f32,                                     // 0: box_min.x
+                -1.0f32,                                     // 1: box_min.y
+                -1.0f32,                                     // 2: box_max.x
+                -1.0f32,                                     // 3: box_max.y
+                new_size.width as f32,                       // 4: screen_size.x
+                new_size.height as f32,                      // 5: screen_size.y
+                self.border_width,                           // 6: border_width
+                self.handle_size,                            // 7: handle_size
+                self.handle_border_width,                    // 8: handle_border_width
+                if self.show_toolbar { 1.0 } else { 0.0 },   // 9: show_toolbar
+                TOOLBAR_HEIGHT,                              // 10: toolbar_height
+                hovered_index,                               // 11: hovered_button
+                if self.toolbar_active { 1.0 } else { 0.0 }, // 12: toolbar_active
+                selected_index,                              // 13: selected_button
+                0.0,                                         // 14: _padding.x
+                0.0,                                         // 15: _padding.y
+                self.border_color[0],                        // 16: border_color.r
+                self.border_color[1],                        // 17: border_color.g
+                self.border_color[2],                        // 18: border_color.b
+                1.0,                                         // 19: border_color.a
+                self.handle_color[0],                        // 20: handle_color.r
+                self.handle_color[1],                        // 21: handle_color.g
+                self.handle_color[2],                        // 22: handle_color.b
+                1.0,                                         // 23: handle_color.a
             ]
         };
 
@@ -458,30 +786,51 @@ impl State {
         None // 临时返回
     }
     fn update_box_with_params(&mut self, min_x: f32, min_y: f32, max_x: f32, max_y: f32) {
+        // 更新当前框坐标
+        self.current_box_coords = Some((min_x, min_y, max_x, max_y));
+
+        let hovered_index = self.hovered_button.map(|i| i as f32).unwrap_or(-1.0);
+        let selected_index = self
+            .toolbar_buttons
+            .iter()
+            .position(|btn| btn.is_selected)
+            .map(|i| i as f32)
+            .unwrap_or(-1.0);
+
         let box_data = [
-            min_x,                    // 0: box_min.x
-            min_y,                    // 1: box_min.y
-            max_x,                    // 2: box_max.x
-            max_y,                    // 3: box_max.y
-            self.size.width as f32,   // 4: screen_size.x
-            self.size.height as f32,  // 5: screen_size.y
-            self.border_width,        // 6: border_width
-            self.handle_size,         // 7: handle_size
-            self.handle_border_width, // 8: handle_border_width
-            0.0f32,                   // 18: _padding1[0] - 新增
-            0.0f32,                   // 18: _padding1[0] - 新增
-            0.0f32,                   // 18: _padding1[0] - 新增
-            self.border_color[0],     // 10: border_color.r
-            self.border_color[1],     // 11: border_color.g
-            self.border_color[2],     // 12: border_color.b
-            1.0,                      // 13: border_color.a
-            self.handle_color[0],     // 14: handle_color.r
-            self.handle_color[1],     // 15: handle_color.g
-            self.handle_color[2],     // 16: handle_color.b
-            1.0,                      // 17: handle_color.a
+            min_x,                                       // 0: box_min.x
+            min_y,                                       // 1: box_min.y
+            max_x,                                       // 2: box_max.x
+            max_y,                                       // 3: box_max.y
+            self.size.width as f32,                      // 4: screen_size.x
+            self.size.height as f32,                     // 5: screen_size.y
+            self.border_width,                           // 6: border_width
+            self.handle_size,                            // 7: handle_size
+            self.handle_border_width,                    // 8: handle_border_width
+            if self.show_toolbar { 1.0 } else { 0.0 },   // 9: show_toolbar
+            TOOLBAR_HEIGHT,                              // 10: toolbar_height
+            hovered_index,                               // 11: hovered_button
+            if self.toolbar_active { 1.0 } else { 0.0 }, // 12: toolbar_active
+            selected_index,                              // 13: selected_button
+            0.0,                                         // 14: _padding.x
+            0.0,                                         // 15: _padding.y
+            self.border_color[0],                        // 16: border_color.r
+            self.border_color[1],                        // 17: border_color.g
+            self.border_color[2],                        // 18: border_color.b
+            1.0,                                         // 19: border_color.a
+            self.handle_color[0],                        // 20: handle_color.r
+            self.handle_color[1],                        // 21: handle_color.g
+            self.handle_color[2],                        // 22: handle_color.b
+            1.0,                                         // 23: handle_color.a
         ];
+
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&box_data));
+
+        // 更新工具栏布局
+        if self.show_toolbar {
+            self.update_toolbar_layout();
+        }
     }
 }
 
@@ -496,6 +845,19 @@ struct App {
     last_update_time: std::time::Instant,      // 添加时间追踪
     needs_redraw: bool,                        // 添加重绘标志
     mouse_press_position: Option<(f32, f32)>,  // 添加鼠标按下位置
+}
+impl App {
+    // 修改App结构，添加工具栏支持
+    fn get_current_box(&self) -> Option<(f32, f32, f32, f32)> {
+        self.current_box
+    }
+
+    // 更新State中的框坐标获取方法
+    fn update_state_box_coords(&mut self) {
+        if let Some(state) = &mut self.state {
+            state.set_current_box_coords(self.current_box);
+        }
+    }
 }
 #[derive(PartialEq)]
 enum DragMode {
@@ -625,7 +987,6 @@ impl ApplicationHandler for App {
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        // 设置控制流：只在有事件时处理
         event_loop.set_control_flow(ControlFlow::Wait);
         if let Some(state) = self.state.as_mut() {
             match event {
@@ -646,15 +1007,19 @@ impl ApplicationHandler for App {
                     if button == MouseButton::Left {
                         match button_state {
                             ElementState::Pressed => {
+                                if let Some(state) = &self.state {
+                                    if state.toolbar_active {
+                                        // 工具栏激活后，只允许工具栏点击，禁用框拖拽
+                                        return;
+                                    }
+                                }
                                 self.mouse_pressed = true;
                                 self.first_drag_move = true;
                                 event_loop.set_control_flow(ControlFlow::Poll);
 
                                 if !self.box_created {
-                                    // 第一次创建框
                                     self.drag_mode = DragMode::Creating;
                                 } else {
-                                    // 框已存在，暂时设置为Moving，在CursorMoved中确定具体模式
                                     self.drag_mode = DragMode::Moving;
                                 }
                             }
@@ -663,17 +1028,40 @@ impl ApplicationHandler for App {
                                 self.first_drag_move = false;
                                 self.mouse_press_position = None;
                                 event_loop.set_control_flow(ControlFlow::Wait);
-
+                                if let Some(mouse_pos) = state.mouse_position {
+                                    // 检查是否点击了工具栏 - 在这里处理点击
+                                    let toolbar_tool =
+                                        state.get_toolbar_button_at(mouse_pos.0, mouse_pos.1);
+                                    if let Some(tool) = toolbar_tool {
+                                        let should_exit = state.handle_toolbar_click(tool);
+                                        state.window.request_redraw();
+                                        if should_exit {
+                                            event_loop.exit();
+                                            return;
+                                        }
+                                        self.mouse_pressed = false; // 重要：阻止后续拖拽
+                                        return;
+                                    }
+                                }
                                 match self.drag_mode {
                                     DragMode::Creating => {
-                                        // 创建框完成，标记为已创建
-                                        self.box_created = true;
+                                        if let Some((min_x, min_y, max_x, max_y)) = self.current_box
+                                        {
+                                            if max_x - min_x >= MIN_BOX_SIZE
+                                                && max_y - min_y >= MIN_BOX_SIZE
+                                            {
+                                                self.box_created = true;
+                                                // 分别调用，避免借用冲突
+                                                state.show_toolbar();
+                                                state.set_current_box_coords(self.current_box);
+                                                state.update_box(min_x, min_y, max_x, max_y);
+                                                state.window.request_redraw();
+                                            }
+                                        }
                                     }
-                                    DragMode::Resizing(_) => {
-                                        // 调整大小完成
-                                    }
-                                    DragMode::Moving => {
-                                        // 移动完成
+                                    DragMode::Resizing(_) | DragMode::Moving => {
+                                        state.set_current_box_coords(self.current_box);
+                                        state.window.request_redraw();
                                     }
                                     DragMode::None => {}
                                 }
@@ -684,70 +1072,26 @@ impl ApplicationHandler for App {
                     }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
-                    if self.box_created && !self.mouse_pressed {
-                        let mouse_x = position.x as f32;
-                        let mouse_y = position.y as f32;
-                        let current_box = self.current_box;
-                        let handle_size = state.handle_size;
+                    let old_hovered = state.hovered_button;
+                    state.update_mouse_position(position.x as f32, position.y as f32);
 
-                        // 检测鼠标在哪个区域
-                        if let Some(handle) = get_handle_at_position_static(
-                            mouse_x,
-                            mouse_y,
-                            current_box,
-                            handle_size,
-                        ) {
-                            // 在手柄上，设置对应的调整大小指针
-                            let cursor = match handle {
-                                ResizeHandle::TopLeft | ResizeHandle::BottomRight => {
-                                    winit::window::CursorIcon::NwseResize
-                                }
-                                ResizeHandle::TopRight | ResizeHandle::BottomLeft => {
-                                    winit::window::CursorIcon::NeswResize
-                                }
-                                ResizeHandle::TopCenter | ResizeHandle::BottomCenter => {
-                                    winit::window::CursorIcon::NsResize
-                                }
-                                ResizeHandle::MiddleLeft | ResizeHandle::MiddleRight => {
-                                    winit::window::CursorIcon::EwResize
-                                }
-                            };
-                            state.window.set_cursor(cursor);
-                        } else if is_mouse_in_box_body_static(
-                            mouse_x,
-                            mouse_y,
-                            current_box,
-                            handle_size,
-                        ) {
-                            // 在框内部，设置移动指针
-                            state.window.set_cursor(winit::window::CursorIcon::Move);
-                        } else {
-                            // 在框外，设置默认指针
-                            state.window.set_cursor(winit::window::CursorIcon::NotAllowed);
-                        }
-                    } else if !self.box_created && !self.mouse_pressed {
-                        // 框未创建时，显示十字指针
-                        state
-                            .window
-                            .set_cursor(winit::window::CursorIcon::Crosshair);
+                    // 如果悬停状态发生变化，请求重绘
+                    if old_hovered != state.hovered_button {
+                        state.window.request_redraw();
                     }
-                    // 存储鼠标位置，用于按下时的检测
+                    // 处理工具栏点击检查 - 移到最前面避免借用冲突
                     if self.mouse_pressed && self.mouse_press_position.is_none() {
-                        self.mouse_press_position = Some((position.x as f32, position.y as f32));
+                        let mouse_pos = (position.x as f32, position.y as f32);
+                        self.mouse_press_position = Some(mouse_pos);
 
                         // 如果框已创建，根据按下位置确定拖拽模式
                         if self.box_created {
-                            let mouse_x = position.x as f32;
-                            let mouse_y = position.y as f32;
-
-                            // 先获取需要的数据，避免借用冲突
                             let current_box = self.current_box;
                             let handle_size = state.handle_size;
 
-                            // 释放对state的借用，然后调用检测方法
                             let handle = get_handle_at_position_static(
-                                mouse_x,
-                                mouse_y,
+                                mouse_pos.0,
+                                mouse_pos.1,
                                 current_box,
                                 handle_size,
                             );
@@ -755,20 +1099,96 @@ impl ApplicationHandler for App {
                             if let Some(handle) = handle {
                                 self.drag_mode = DragMode::Resizing(handle);
                             } else if is_mouse_in_box_body_static(
-                                mouse_x,
-                                mouse_y,
+                                mouse_pos.0,
+                                mouse_pos.1,
                                 current_box,
                                 handle_size,
                             ) {
                                 self.drag_mode = DragMode::Moving;
                             } else {
-                                // 点击在框外，创建新框
                                 self.drag_mode = DragMode::None;
-                                self.mouse_pressed = false; // 取消鼠标按下状态
+                                self.mouse_pressed = false;
                             }
                         }
                     }
 
+                    // 处理鼠标指针样式
+                    if !self.mouse_pressed {
+                        let mouse_x = position.x as f32;
+                        let mouse_y = position.y as f32;
+
+                        // 先提取需要的值，避免在检查过程中持续借用state
+                        let toolbar_button_exists =
+                            state.get_toolbar_button_at(mouse_x, mouse_y).is_some();
+                        let current_box = self.current_box;
+                        let handle_size = state.handle_size;
+                        let toolbar_active = state.toolbar_active; // 提前获取这个值
+
+                        // 优先检查工具栏
+                        if toolbar_button_exists {
+                            state.window.set_cursor(winit::window::CursorIcon::Pointer); // 改为手型指针
+                        } else if self.box_created && !toolbar_active {
+                            // 只有在工具栏未激活时才显示调整大小指针
+                            if let Some(handle) = get_handle_at_position_static(
+                                mouse_x,
+                                mouse_y,
+                                current_box,
+                                handle_size,
+                            ) {
+                                let cursor = match handle {
+                                    ResizeHandle::TopLeft | ResizeHandle::BottomRight => {
+                                        winit::window::CursorIcon::NwseResize
+                                    }
+                                    ResizeHandle::TopRight | ResizeHandle::BottomLeft => {
+                                        winit::window::CursorIcon::NeswResize
+                                    }
+                                    ResizeHandle::TopCenter | ResizeHandle::BottomCenter => {
+                                        winit::window::CursorIcon::NsResize
+                                    }
+                                    ResizeHandle::MiddleLeft | ResizeHandle::MiddleRight => {
+                                        winit::window::CursorIcon::EwResize
+                                    }
+                                };
+                                state.window.set_cursor(cursor);
+                            } else if is_mouse_in_box_body_static(
+                                mouse_x,
+                                mouse_y,
+                                current_box,
+                                handle_size,
+                            ) {
+                                state.window.set_cursor(winit::window::CursorIcon::Move);
+                            } else {
+                                state
+                                    .window
+                                    .set_cursor(winit::window::CursorIcon::NotAllowed); // 改为十字指针，更适合截图
+                            }
+                        } else if self.box_created && toolbar_active {
+                            // 工具栏激活时，需要区分框内和框外
+                            if is_mouse_in_box_body_static(
+                                mouse_x,
+                                mouse_y,
+                                current_box,
+                                handle_size,
+                            ) {
+                                // 在框内：显示默认指针
+                                state.window.set_cursor(winit::window::CursorIcon::Default);
+                            } else {
+                                // 在框外：显示禁止指针
+                                state
+                                    .window
+                                    .set_cursor(winit::window::CursorIcon::NotAllowed);
+                            }
+                        } else {
+                            // 没有框时，显示十字指针
+                            state
+                                .window
+                                .set_cursor(winit::window::CursorIcon::Crosshair);
+                        }
+                    }
+                    // 工具栏激活后禁用所有拖拽操作
+                    if state.toolbar_active {
+                        return;
+                    }
                     if !self.mouse_pressed || self.drag_mode == DragMode::None {
                         return;
                     }
@@ -788,7 +1208,6 @@ impl ApplicationHandler for App {
 
                     match self.drag_mode {
                         DragMode::Creating => {
-                            // 创建新框的逻辑
                             if self.first_drag_move {
                                 self.box_start = (position.x as f32, position.y as f32);
                                 self.first_drag_move = false;
@@ -799,13 +1218,14 @@ impl ApplicationHandler for App {
                                 let max_x = self.box_start.0.max(current_pos.0);
                                 let max_y = self.box_start.1.max(current_pos.1);
 
-                                self.current_box = Some((min_x, min_y, max_x, max_y));
-                                state.update_box(min_x, min_y, max_x, max_y);
-                                self.needs_redraw = true;
+                                if max_x - min_x >= MIN_BOX_SIZE && max_y - min_y >= MIN_BOX_SIZE {
+                                    self.current_box = Some((min_x, min_y, max_x, max_y));
+                                    state.update_box(min_x, min_y, max_x, max_y);
+                                    self.needs_redraw = true;
+                                }
                             }
                         }
                         DragMode::Moving => {
-                            // 移动逻辑
                             if let Some((box_min_x, box_min_y, box_max_x, box_max_y)) =
                                 self.current_box
                             {
@@ -861,12 +1281,16 @@ impl ApplicationHandler for App {
                                         final_max_x,
                                         final_max_y,
                                     );
+
+                                    // 调整大小时更新工具栏位置
+                                    if self.box_created {
+                                        state.set_current_box_coords(self.current_box);
+                                    }
                                     state.window.request_redraw();
                                 }
                             }
                         }
                         DragMode::Resizing(handle) => {
-                            // 调整大小逻辑
                             if let Some((mut min_x, mut min_y, mut max_x, mut max_y)) =
                                 self.current_box
                             {
@@ -945,6 +1369,12 @@ impl ApplicationHandler for App {
 
                                 self.current_box = Some((min_x, min_y, max_x, max_y));
                                 state.update_box(min_x, min_y, max_x, max_y);
+
+                                // 调整大小时更新工具栏位置
+                                if self.box_created {
+                                    state.set_current_box_coords(self.current_box);
+                                }
+
                                 state.window.request_redraw();
                             }
                         }
@@ -962,14 +1392,15 @@ impl ApplicationHandler for App {
                     if event.state == winit::event::ElementState::Pressed {
                         match event.physical_key {
                             PhysicalKey::Code(KeyCode::KeyR) => {
-                                // R键：重置，清除框
+                                // R键重置
                                 self.box_created = false;
                                 self.current_box = None;
                                 self.drag_mode = DragMode::None;
+                                state.hide_toolbar();
+                                state.set_current_box_coords(None);
                                 state.update_box(-1.0, -1.0, -1.0, -1.0);
                                 state.window.request_redraw();
                             }
-
                             PhysicalKey::Code(KeyCode::Escape) => {
                                 event_loop.exit();
                             }

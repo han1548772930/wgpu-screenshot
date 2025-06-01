@@ -13,7 +13,6 @@ screenshots = "0.8"
 display-info = "0.5.4"
 bytemuck = { version = "1.4", features = ["derive"] }
 
-
 [profile.release]
 #panic = "abort"
 codegen-units = 1

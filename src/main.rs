@@ -567,7 +567,7 @@ impl State {
                     present_mode: wgpu::PresentMode::Mailbox,
                     alpha_mode: wgpu::CompositeAlphaMode::Auto,
                     view_formats: vec![],
-                    desired_maximum_frame_latency: 1,
+                    desired_maximum_frame_latency: 3,
                 },
             );
         }

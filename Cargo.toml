@@ -1,0 +1,22 @@
+[package]
+name = "wgpu-screenshot"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+env_logger = "0.11"
+pollster = "0.4"
+wgpu = "25.0.0"
+
+winit = { version = "0.30" }
+screenshots = "0.8"
+display-info = "0.5.4"
+bytemuck = { version = "1.4", features = ["derive"] }
+
+
+[profile.release]
+#panic = "abort"
+codegen-units = 1
+lto = true
+#incremental = false
+opt-level = 2

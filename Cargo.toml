@@ -12,7 +12,8 @@ winit = { version = "0.30" }
 screenshots = "0.8"
 display-info = "0.5.4"
 bytemuck = { version = "1.4", features = ["derive"] }
-
+resvg = "0.45"
+usvg = "0.45"
 [profile.release]
 #panic = "abort"
 codegen-units = 1

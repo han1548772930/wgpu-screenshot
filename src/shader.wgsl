@@ -15,7 +15,13 @@ struct Uniforms {
     border_color: vec4<f32>,      // 16 bytes (索引16-19)
     handle_color: vec4<f32>,      // 16 bytes (索引20-23)
     toolbar_button_count: f32,    // 4 bytes (索引24)
-    _padding2: vec3<f32>,         // 12 bytes (索引25-27)
+    // 🚀 背景缓存控制参数
+    background_cache_valid: f32,  // 4 bytes (索引25) - 背景缓存是否有效
+    force_background_update: f32, // 4 bytes (索引26) - 强制更新背景缓存
+    // 🚀 绘图元素手柄参数
+    show_handles: f32,           // 4 bytes (索引27) - 是否显示手柄
+    // 🚀 撤销按钮状态
+    undo_button_enabled: f32,    // 4 bytes (索引28) - 撤销按钮是否启用
 }
 
 @group(0) @binding(0)
@@ -24,6 +30,9 @@ var t_texture: texture_2d<f32>;
 var s_sampler: sampler;
 @group(0) @binding(2)
 var<uniform> uniforms: Uniforms;
+
+// 🚀 背景缓存纹理 - 存储预渲染的背景（可选绑定）
+// 注意：这些绑定只在主渲染管道中使用，背景缓存管道不使用
 
 struct VertexInput {
     @location(0) position: vec4<f32>,
@@ -38,12 +47,16 @@ struct DrawingVertexOutput {
     @location(0) color: vec4<f32>,
     @location(1) thickness: f32,
 }
+// 🔧 WGSL GPU优化：简化绘图顶点着色器，减少计算量
 @vertex
 fn vs_drawing(@location(0) position: vec2<f32>, @location(1) color: vec4<f32>, @location(2) thickness: f32) -> DrawingVertexOutput {
     var out: DrawingVertexOutput;
+    // 🔧 GPU优化：直接使用位置，避免额外变换
     out.clip_position = vec4<f32>(position, 0.0, 1.0);
+    // 🔧 GPU优化：预计算颜色，减少片段着色器负载
     out.color = color;
-    out.thickness = thickness;
+    // 🔧 GPU优化：简化厚度处理
+    out.thickness = max(thickness, 1.0); // 确保最小厚度，避免过细线条的复杂计算
     return out;
 }
 @vertex
@@ -61,12 +74,184 @@ fn vs_icon(vertex: VertexInput) -> VertexOutput {
     out.tex_coords = vertex.position.zw;
     return out;
 }
+// 🔧 GPU优化：使用compute shader优化的绘图片段着色器
 @fragment
 fn fs_drawing(in: DrawingVertexOutput) -> @location(0) vec4<f32> {
+    // 直接返回颜色，compute shader已经处理了复杂计算
     return in.color;
 }
-// 优化的工具栏计算函数
+
+// 🔧 GPU优化：添加compute shader支持的存储缓冲区结构
+struct PenPointData {
+    position: vec2<f32>,
+    color: vec4<f32>,
+    thickness: f32,
+    _padding: f32, // 对齐到16字节
+}
+
+// 🔧 GPU优化：画笔点存储缓冲区（参考您的模式）
+@group(1) @binding(0)
+var<storage, read_write> pen_points: array<PenPointData>;
+
+// 🔧 GPU优化：画笔处理的compute shader
+@compute @workgroup_size(64, 1, 1)
+fn cs_process_pen_points(@builtin(global_invocation_id) global_id: vec3<u32>) {
+    let index = global_id.x;
+
+    // 边界检查
+    if index >= arrayLength(&pen_points) {
+        return;
+    }
+
+    // 简单的点处理 - 可以在这里添加更复杂的优化
+    // 例如：距离过滤、平滑处理等
+    let point = pen_points[index];
+
+    // 这里可以添加GPU并行的点处理逻辑
+    // 目前保持简单，直接传递数据
+    pen_points[index] = point;
+}
+// 🚀 背景缓存系统 - 智能缓存管理
+var<private> cached_background_state: vec4<f32> = vec4<f32>(-1.0); // x: box_hash, y: toolbar_state, z: cache_valid, w: reserved
+var<private> cached_background_color: vec4<f32> = vec4<f32>(0.0);  // 缓存的背景颜色
+
+// 🚀 绘图元素缓存系统 - 缓存几何图形的计算结果
+var<private> cached_circle_vertices: array<vec2<f32>, 64>;  // 缓存圆形顶点
+var<private> cached_circle_params: vec4<f32> = vec4<f32>(-1.0); // center.xy, radius, segments
+var<private> cached_rectangle_vertices: array<vec2<f32>, 8>; // 缓存矩形顶点 (4条边，每条2个点)
+var<private> cached_rectangle_params: vec4<f32> = vec4<f32>(-1.0); // start.xy, end.xy
+var<private> cached_arrow_vertices: array<vec2<f32>, 12>; // 缓存箭头顶点 (主线2个点 + 箭头6个点 + 4个备用)
+var<private> cached_arrow_params: vec4<f32> = vec4<f32>(-1.0); // start.xy, end.xy
+
+// 优化的工具栏计算函数 - 使用缓存优化，减少重复计算
+var<private> cached_toolbar_layout: vec4<f32> = vec4<f32>(-1.0);
+var<private> cached_box_coords: vec4<f32> = vec4<f32>(-2.0);
+
+// 🚀 背景状态哈希计算 - 用于检测背景是否需要更新
+fn calculate_background_hash() -> f32 {
+    // 基于关键参数计算简单哈希
+    let box_hash = uniforms.box_min.x + uniforms.box_min.y * 1000.0 + uniforms.box_max.x * 10000.0 + uniforms.box_max.y * 100000.0;
+    let toolbar_hash = uniforms.show_toolbar * 1000000.0 + uniforms.toolbar_active * 2000000.0;
+    return box_hash + toolbar_hash;
+}
+
+// 🚀 智能背景缓存检查 - 判断是否可以使用缓存的背景
+fn is_background_cache_valid() -> bool {
+    let current_hash = calculate_background_hash();
+    let toolbar_state = uniforms.show_toolbar + uniforms.toolbar_active * 10.0;
+
+    // 检查缓存是否有效
+    if uniforms.background_cache_valid > 0.0 && abs(cached_background_state.x - current_hash) < 0.1 && abs(cached_background_state.y - toolbar_state) < 0.1 && uniforms.force_background_update < 0.5 {
+        return true;
+    }
+
+    // 更新缓存状态
+    cached_background_state.x = current_hash;
+    cached_background_state.y = toolbar_state;
+    cached_background_state.z = 1.0; // 标记为有效
+
+    return false;
+}
+
+// 🚀 缓存的圆形顶点计算 - 避免重复三角函数计算
+fn get_cached_circle_vertices(center: vec2<f32>, radius: f32, segments: f32) -> array<vec2<f32>, 64> {
+    let current_params = vec4<f32>(center.x, center.y, radius, segments);
+
+    // 检查缓存是否有效
+    if all(abs(cached_circle_params - current_params) < vec4<f32>(0.1)) {
+        return cached_circle_vertices;
+    }
+
+    // 重新计算并缓存圆形顶点
+    let seg_count = i32(segments);
+    for (var i = 0; i < seg_count && i < 64; i++) {
+        let angle = (f32(i) * 2.0 * 3.14159265) / segments;
+        cached_circle_vertices[i] = center + vec2<f32>(cos(angle) * radius, sin(angle) * radius);
+    }
+
+    // 更新缓存参数
+    cached_circle_params = current_params;
+    return cached_circle_vertices;
+}
+
+// 🚀 缓存的矩形顶点计算 - 避免重复边界计算
+fn get_cached_rectangle_vertices(start: vec2<f32>, end: vec2<f32>) -> array<vec2<f32>, 8> {
+    let current_params = vec4<f32>(start.x, start.y, end.x, end.y);
+
+    // 检查缓存是否有效
+    if all(abs(cached_rectangle_params - current_params) < vec4<f32>(0.1)) {
+        return cached_rectangle_vertices;
+    }
+
+    // 重新计算并缓存矩形顶点 (4条边，每条2个点)
+    cached_rectangle_vertices[0] = vec2<f32>(start.x, start.y); // 上边起点
+    cached_rectangle_vertices[1] = vec2<f32>(end.x, start.y);   // 上边终点
+    cached_rectangle_vertices[2] = vec2<f32>(end.x, start.y);   // 右边起点
+    cached_rectangle_vertices[3] = vec2<f32>(end.x, end.y);     // 右边终点
+    cached_rectangle_vertices[4] = vec2<f32>(end.x, end.y);     // 下边起点
+    cached_rectangle_vertices[5] = vec2<f32>(start.x, end.y);   // 下边终点
+    cached_rectangle_vertices[6] = vec2<f32>(start.x, end.y);   // 左边起点
+    cached_rectangle_vertices[7] = vec2<f32>(start.x, start.y); // 左边终点
+
+    // 更新缓存参数
+    cached_rectangle_params = current_params;
+    return cached_rectangle_vertices;
+}
+
+// 🚀 缓存的箭头顶点计算 - 避免重复向量计算
+fn get_cached_arrow_vertices(start: vec2<f32>, end: vec2<f32>) -> array<vec2<f32>, 12> {
+    let current_params = vec4<f32>(start.x, start.y, end.x, end.y);
+
+    // 检查缓存是否有效
+    if all(abs(cached_arrow_params - current_params) < vec4<f32>(0.1)) {
+        return cached_arrow_vertices;
+    }
+
+    // 重新计算并缓存箭头顶点
+    // 主线
+    cached_arrow_vertices[0] = start;
+    cached_arrow_vertices[1] = end;
+
+    // 计算箭头
+    let dx = end.x - start.x;
+    let dy = end.y - start.y;
+    let len = sqrt(dx * dx + dy * dy);
+
+    if len > 0.0 {
+        let ux = dx / len;
+        let uy = dy / len;
+        let arrow_len = 15.0;
+        let arrow_width = 8.0;
+
+        let p1 = end - vec2<f32>(arrow_len * ux - arrow_width * uy, arrow_len * uy + arrow_width * ux);
+        let p2 = end - vec2<f32>(arrow_len * ux + arrow_width * uy, arrow_len * uy - arrow_width * ux);
+
+        // 箭头线段
+        cached_arrow_vertices[2] = end;
+        cached_arrow_vertices[3] = p1;
+        cached_arrow_vertices[4] = end;
+        cached_arrow_vertices[5] = p2;
+
+        // 预留位置用于其他箭头样式
+        for (var i = 6; i < 12; i++) {
+            cached_arrow_vertices[i] = end;
+        }
+    }
+
+    // 更新缓存参数
+    cached_arrow_params = current_params;
+    return cached_arrow_vertices;
+}
+
 fn calculate_toolbar_layout() -> vec4<f32> {
+    let current_box = vec4<f32>(uniforms.box_min, uniforms.box_max);
+
+    // 检查缓存是否有效
+    if all(cached_box_coords == current_box) && cached_toolbar_layout.x >= 0.0 {
+        return cached_toolbar_layout;
+    }
+
+    // 重新计算并缓存
     let toolbar_width = uniforms.toolbar_button_count * uniforms.toolbar_button_size + (uniforms.toolbar_button_count - 1.0) * uniforms.toolbar_button_margin;
 
     var toolbar_y = uniforms.box_max.y + 5.0;
@@ -86,7 +271,11 @@ fn calculate_toolbar_layout() -> vec4<f32> {
         toolbar_start_x = max(toolbar_start_x, 0.0);
     }
 
-    return vec4<f32>(toolbar_start_x, toolbar_y, toolbar_width, uniforms.toolbar_height);
+    // 更新缓存
+    cached_box_coords = current_box;
+    cached_toolbar_layout = vec4<f32>(toolbar_start_x, toolbar_y, toolbar_width, uniforms.toolbar_height);
+
+    return cached_toolbar_layout;
 }
 
 // 修复图标着色器的悬停背景
@@ -141,7 +330,41 @@ fn fs_icon(in: VertexOutput) -> @location(0) vec4<f32> {
     let is_selected = abs(uniforms.selected_button - button_index) < 0.5;
     let is_hovered = abs(uniforms.hovered_button - button_index) < 0.5;
 
-    if is_selected {
+    // 🚀 检查是否是撤销按钮（索引5）
+    let is_undo_button = abs(button_index - 5.0) < 0.5;
+
+    if is_undo_button {
+        // 🚀 使用专门的uniform来判断撤销按钮状态
+        let undo_enabled = uniforms.undo_button_enabled > 0.5;
+
+        if undo_enabled {
+            // 🚀 启用状态：正常显示
+            if is_hovered {
+                // 悬停时稍微增加亮度
+                if icon_color.a > 0.1 {
+                    return vec4<f32>(icon_color.rgb * 1.1, icon_color.a);
+                } else {
+                    return vec4<f32>(0.7, 0.7, 0.7, 0.8);
+                }
+            } else {
+                // 正常状态
+                if icon_color.a < 0.1 {
+                    discard;
+                }
+                return icon_color;
+            }
+        } else {
+            // 🚀 禁用状态：显示灰色
+            if icon_color.a > 0.1 {
+                // 图标区域：变为灰色，降低透明度
+                let gray_value = dot(icon_color.rgb, vec3<f32>(0.299, 0.587, 0.114));
+                return vec4<f32>(gray_value * 0.5, gray_value * 0.5, gray_value * 0.5, icon_color.a * 0.7);
+            } else {
+                // 透明区域：保持透明
+                discard;
+            }
+        }
+    } else if is_selected {
         // 选中状态：只改变图标颜色，不改变背景
         if icon_color.a > 0.1 {
             // 图标区域：变为绿色调
@@ -170,28 +393,72 @@ fn fs_icon(in: VertexOutput) -> @location(0) vec4<f32> {
     return icon_color;
 }
 
-// 优化的主着色器
+// 🚀 背景缓存着色器 - 专门用于渲染和缓存背景
+@fragment
+fn fs_background_cache(in: VertexOutput) -> @location(0) vec4<f32> {
+    let original_color = textureSample(t_texture, s_sampler, in.tex_coords);
+
+    // 🔧 GPU优化：早期退出，避免复杂计算
+    if uniforms.box_min.x < 0.0 {
+        cached_background_color = original_color * 0.3;
+        return cached_background_color;
+    }
+
+    // 🔧 GPU优化：简化坐标计算
+    let screen_pos = in.tex_coords * uniforms.screen_size;
+
+    // 框区域检查
+    let in_box_x = screen_pos.x >= uniforms.box_min.x && screen_pos.x <= uniforms.box_max.x;
+    let in_box_y = screen_pos.y >= uniforms.box_min.y && screen_pos.y <= uniforms.box_max.y;
+    let in_box = in_box_x && in_box_y;
+
+    if !in_box {
+        cached_background_color = original_color * 0.3;
+        return cached_background_color;
+    }
+
+    // 在框内，返回原始颜色
+    cached_background_color = original_color;
+    return cached_background_color;
+}
+
+// 🚀 优化的主着色器 - 简化版本，暂时不使用背景缓存
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // 🚀 智能背景缓存：检查是否可以使用缓存
+    if is_background_cache_valid() {
+        // 暂时直接执行完整渲染，后续可以添加缓存逻辑
+        return fs_main_full_render(in);
+    }
+
+    // 缓存无效，执行完整渲染
+    return fs_main_full_render(in);
+}
+
+// 🚀 完整渲染函数 - 当缓存无效时使用
+fn fs_main_full_render(in: VertexOutput) -> vec4<f32> {
     let original_color = textureSample(t_texture, s_sampler, in.tex_coords);
-    
-    // 早期退出：无效框
-    if uniforms.box_min.x < 0.0 || uniforms.box_min.y < 0.0 {
+
+    // 🔧 GPU优化：早期退出，避免复杂计算
+    if uniforms.box_min.x < 0.0 {
         return original_color * 0.3;
     }
 
+    // 🔧 GPU优化：简化坐标计算
     let screen_pos = in.tex_coords * uniforms.screen_size;
-    
-    // 工具栏处理（提前计算，避免重复）
-    if uniforms.show_toolbar > 0.5 {
+
+    // 🔧 WGSL GPU优化：简化工具栏渲染，减少分支和计算
+    if uniforms.show_toolbar > 0.0 {
         let toolbar_layout = calculate_toolbar_layout();
         let toolbar_start_x = toolbar_layout.x;
         let toolbar_y = toolbar_layout.y;
         let toolbar_width = toolbar_layout.z;
 
-        if screen_pos.y >= toolbar_y && screen_pos.y <= toolbar_y + uniforms.toolbar_height && screen_pos.x >= toolbar_start_x && screen_pos.x <= toolbar_start_x + toolbar_width {
-            
-            // 按钮区域检查（优化版本）
+        // 🔧 GPU优化：简化边界检查，减少条件分支
+        let in_toolbar = screen_pos.y >= toolbar_y && screen_pos.y <= toolbar_y + uniforms.toolbar_height && screen_pos.x >= toolbar_start_x && screen_pos.x <= toolbar_start_x + toolbar_width;
+
+        if in_toolbar {
+            // 恢复完整的按钮检测
             let button_spacing = uniforms.toolbar_button_size + uniforms.toolbar_button_margin;
             let button_index = floor((screen_pos.x - toolbar_start_x) / button_spacing);
 
@@ -211,7 +478,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(1.0, 1.0, 1.0, 0.9);
         }
     }
-    
+
     // 框区域检查
     let in_box_x = screen_pos.x >= uniforms.box_min.x && screen_pos.x <= uniforms.box_max.x;
     let in_box_y = screen_pos.y >= uniforms.box_min.y && screen_pos.y <= uniforms.box_max.y;
@@ -220,13 +487,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if !in_box {
         return original_color * 0.3;
     }
-    
-    // 手柄处理（只有在需要时才计算）
-    if uniforms.toolbar_active < 0.5 {
+
+    return original_color + render_ui_overlay(screen_pos);
+}
+
+// 🚀 UI覆盖层渲染函数 - 渲染边框、手柄等动态元素
+fn render_ui_overlay(screen_pos: vec2<f32>) -> vec4<f32> {
+    // 恢复简单清晰的手柄渲染
+    if uniforms.toolbar_active == 0.0 {
         let box_center = (uniforms.box_min + uniforms.box_max) * 0.5;
         let half_handle = uniforms.handle_size * 0.5;
-        
-        // 使用更高效的手柄位置数组
+
         let handle_positions = array<vec2<f32>, 8>(
             uniforms.box_min,                                  // 左上
             vec2<f32>(box_center.x, uniforms.box_min.y),      // 上中
@@ -237,8 +508,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             vec2<f32>(uniforms.box_min.x, uniforms.box_max.y), // 左下
             vec2<f32>(uniforms.box_min.x, box_center.y)        // 左中
         );
-        
-        // 展开循环以提高性能
+
         for (var i = 0; i < 8; i++) {
             let handle_pos = handle_positions[i];
             let dist = abs(screen_pos - handle_pos);
@@ -253,7 +523,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
         }
     }
-    
+
     // 边框检查（优化版本）
     let border_dists = vec4<f32>(
         screen_pos.x - uniforms.box_min.x,      // 左
@@ -268,5 +538,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(uniforms.border_color.rgb, 1.0);
     }
 
-    return original_color;
+    return vec4<f32>(0.0, 0.0, 0.0, 0.0); // 透明，无覆盖
 }

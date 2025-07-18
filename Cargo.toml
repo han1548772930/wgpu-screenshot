@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 env_logger = "0.11"
 pollster = "0.4"
-wgpu = "25.0.0"
+wgpu = "26.0.0"
+glyphon = { path = "./glyphon" }
 
 winit = { version = "0.30" }
 screenshots = "0.8"
